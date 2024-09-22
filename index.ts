@@ -1,20 +1,44 @@
-import express, {
-  Request,
-  Response,
-  Application,
-  NextFunction,
-  json,
-} from "express";
+import os from "node:os";
+import Cluster from "node:cluster";
 import { ExternalCopy, Isolate, Reference, Copy } from "isolated-vm";
 import { Agent, fetch, Pool } from 'undici';
-import { Utils } from "./sandbox-utils.js";
-import { timingSafeEqual } from "crypto";
 import dns from "dns";
 import ip from 'ip';
-interface Config {
+import { Utils } from "./sandbox-utils.js";
+import { EvalSocket, EvalResponse, EvalServer } from "./server";
+import { PotatWorker, PotatWorkersPool } from "./workers";
+
+const config = require('./config.json');
+
+export interface Config {
   port: number;
   auth: string;
+  queueSize: number;
+
+  fetchTimeout: number;
+  fetchMaxResponseLength: number;
   maxFetchConcurrency: number;
+
+  workersTimeOut: number;
+
+  vmMemoryLimit: number;
+  vmTimeout: number;
+
+  maxChildProcessCount: number;
+}
+
+const defaultConfig: Partial<Config> = {
+  fetchTimeout: 5000,
+  fetchMaxResponseLength: 10000,
+  maxFetchConcurrency: 5,
+  queueSize: 20,
+
+  workersTimeOut: 6e5,
+
+  vmMemoryLimit: 32,
+  vmTimeout: 9000,
+
+  maxChildProcessCount: os.availableParallelism(),
 }
 
 interface Waiter {
@@ -22,13 +46,6 @@ interface Waiter {
   msg: any;
   resolve: (value: any) => void;
   reject: (reason: any) => void;
-}
-
-interface EvalResponse {
-  data: any[];
-  statusCode: number;
-  duration: number;
-  errors?: { message: string }[];
 }
 
 interface EvalPotatData {
@@ -40,56 +57,83 @@ interface EvalPotatData {
   isSilent: boolean,
 };
 
-new (class EvalServer {
-  private server: Application;
-  private config: Config;
+export class Evaluator {
   private queue: Waiter[] = [];
   private processing: boolean = false;
   private concurrencyCounter: number = 0;
 
-  private readonly maxConcurrency: number;
+  private readonly pool: PotatWorkersPool<typeof this.add>;
 
-  constructor(config: Config) {
-    this.maxConcurrency = config.maxFetchConcurrency ?? 5;
-    this.config = config;
-    this.server = express();
-    this.server.use(json());
-    this.setupRoute();
+  public constructor(private readonly config: Config) {
+    if (Cluster.isPrimary) {
+      this.startServer();
+    }
+
+    this.pool = new PotatWorkersPool(this.add.bind(this), Math.max(1, config.maxChildProcessCount), {
+      maxQueueSizePerWorker: this.config.queueSize,
+
+      workerTimeOut: this.config.workersTimeOut,
+      workerExecutionTimeout: this.config.vmTimeout,
+    });
   }
 
-  private setupRoute() {
-    this.server.post(
-      "/eval",
-      this.authenticate.bind(this),
-      async (req: Request, res: Response) => {
-        const start = performance.now();
+  private async startServer() {
+    const httpServer = new EvalServer(this.config.auth, this.handleEvalRequests.bind(this));
 
-        try {
-          const result = await this.add(req.body.code, req.body.msg);
+    const server = httpServer.listen(this.config.port, () => {
+      console.log(`Server listening on port ${this.config.port}`);
+    });
 
-          res.status(200).send({
-            data: [String(result)],
-            statusCode: 200,
-            duration: parseFloat((performance.now() - start).toFixed(4)),
-          } as EvalResponse);
-        } catch (e) {
-          console.error(e);
+    new EvalSocket(server, this.config.auth, this.handleEvalRequests.bind(this));
+  }
 
-          res.status(500).send({
-            data: [],
-            duration: parseFloat((performance.now() - start).toFixed(4)),
-            errors: [{ message: "Internal server error" }],
-          })
-        }
+  private async handleEvalRequests(code: string, msg: any): Promise<EvalResponse> {
+    const start = performance.now();
+    const duration = () => parseFloat((performance.now() - start).toFixed(4));
+
+    if (!code || typeof code !== "string") {
+      return {
+        statusCode: 400,
+        data: [],
+        duration: duration(),
+        errors: [{
+          message: typeof code !== "string" ? "Invalid code" : "Missing code"
+        }],
+      };
+    }
+
+    if (msg && typeof msg !== "object") {
+      return {
+        statusCode: 400,
+        data: [],
+        duration: duration(),
+        errors: [{ message: "Invalid message" }],
+      };
+    }
+
+    try {
+      const result = await this.pool.add(code, msg);
+
+      return {
+        statusCode: 200,
+        duration: duration(),
+        data: [String(result)],
+        errors: [],
       }
-    );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
 
-    this.startServer();
+      return {
+        statusCode: 500,
+        data: [],
+        duration: duration(),
+        errors: [{ message: message || "Internal server error" }],
+      }
+    }
   }
 
-  private async add(code: string, msg: any): Promise<any> {
+  private async add(code: string, msg: any): Promise<string> {
     return new Promise((resolve, reject) => {
-      if (this.queue.length > 20) reject("Queue is full");
       this.queue.push({ code, msg, resolve, reject } as Waiter);
       this.process();
     });
@@ -111,10 +155,10 @@ new (class EvalServer {
     this.processing = false;
   }
 
-  private async eval(code: string, msg): Promise<string> {
+  private async eval(code: string, msg?: Record<string, any>): Promise<string> {
     return new Promise(async (resolve, reject) => {
       try {
-        const isolate = new Isolate({ 
+        const isolate = new Isolate({
           memoryLimit: 8,
           onCatastrophicError: (e) => {
             reject(e);
@@ -128,8 +172,6 @@ new (class EvalServer {
 
             await jail.set("global", jail.derefInto());
 
-            /** @todo handle trimming of excess message data on application side */
-            delete msg?.channel?.data?.command_stats;
             delete msg?.channel?.commands;
             delete msg?.command?.description;
             delete msg?.channel?.blocks;
@@ -144,7 +186,7 @@ new (class EvalServer {
             };
 
             const prelude = `
-              'use strict'; 
+              'use strict';
 
               function toString(value) {
                 if (typeof value === 'string') return value;
@@ -152,16 +194,16 @@ new (class EvalServer {
                 if (value instanceof Promise) return value.then(toString);
                 if (Array.isArray(value)) return value.map(toString).join(', ');
                 return JSON.stringify(value);
-              } 
+              }
 
-              let msg = JSON.parse(${JSON.stringify(JSON.stringify(msg))});
+              let msg = JSON.parse(${JSON.stringify(JSON.stringify(msg ?? {}))});
             `;
 
             await context.evalClosure(`
-              global.fetch = (url, options) => $0.apply(undefined, [url, options], { 
-                  arguments: { copy: true }, 
-                  promise: true, 
-                  result: { copy: true, promise: true } 
+              global.fetch = (url, options) => $0.apply(undefined, [url, options], {
+                  arguments: { copy: true },
+                  promise: true,
+                  result: { copy: true, promise: true }
                 })
               `,
               [new Reference(this.fetchImplement.bind(this, potatData))],
@@ -184,14 +226,14 @@ new (class EvalServer {
               code = prelude + `toString(eval('${code?.replace(/[\\"']/g, "\\$&")}'))`;
             }
 
-            return context.eval(code, { timeout: 5000, promise: true });
+            return context.eval(code, { timeout: this.config.vmTimeout + 1e3, promise: true });
           })
           .catch((e) => { return '🚫 ' + e.constructor.name + ': ' + e.message; })
           .finally(() => isolate.dispose());
 
         this.concurrencyCounter = 0;
 
-        resolve((result ?? null)?.slice(0, 3000));
+        resolve((result ?? null)?.slice(0, this.config.fetchMaxResponseLength));
       } catch (e) {
         reject(e);
       }
@@ -202,10 +244,10 @@ new (class EvalServer {
     this.concurrencyCounter++;
 
     try {
-      if (this.concurrencyCounter > this.maxConcurrency) {
-        return new ExternalCopy({ 
-          body: 'Too many requests.', 
-          status: 429 
+      if (this.concurrencyCounter > this.config.maxFetchConcurrency) {
+        return new ExternalCopy({
+          body: 'Too many requests.',
+          status: 429
         }).copyInto();
       }
 
@@ -221,19 +263,19 @@ new (class EvalServer {
         headers: {
           ...options?.headers ?? {},
           'User-Agent': 'Sandbox Unsafe JavaScript Execution Environment - https://github.com/RyanPotat/eval-server/',
-          'x-potat-data': JSON.stringify(potatData),
+          'x-potat-data': encodeURIComponent(JSON.stringify(potatData)),
         }
       })
 
-      return new ExternalCopy({ 
-        body: await this.parseBlob(await res.blob()), status: res.status 
+      return new ExternalCopy({
+        body: await this.parseBlob(await res.blob()), status: res.status
       }).copyInto();
     } catch (e) {
       // Promise aborted by timeout.
       if (e.constructor.name === 'DOMException') {
-        return new ExternalCopy({ 
-          body: 'Request timed out.', 
-          status: 408 
+        return new ExternalCopy({
+          body: 'Request timed out.',
+          status: 408
         }).copyInto();
       }
       return new ExternalCopy({
@@ -247,7 +289,7 @@ new (class EvalServer {
 
   private timeout() {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(), 5000);
+    setTimeout(() => controller.abort(), this.config.fetchTimeout);
     return controller.signal;
   }
 
@@ -276,6 +318,12 @@ new (class EvalServer {
   private dispatcherFactory(origin: string, options: Pool.Options) {
     const url = new URL(origin);
 
+    const ipv6adresss = url.hostname.match(/^\[(.*)\]$/);
+
+    if (ip.isV6Format(ipv6adresss?.[1])) {
+      this.throwIfPrivateIP(ipv6adresss?.[1]);
+    }
+
     if (ip.isV4Format(url.hostname) || ip.isV6Format(url.hostname)) {
       this.throwIfPrivateIP(url.hostname);
     }
@@ -291,30 +339,13 @@ new (class EvalServer {
 
   private async parseBlob(blob: Blob): Promise<string> {
     let data: any;
-    try { data = JSON.parse(await blob.text()); } 
+    try { data = JSON.parse(await blob.text()); }
     catch { data = await blob.text(); }
     return data;
   }
+}
 
-  private authenticate(req: Request, res: Response, next: NextFunction) {
-    const posessed = Buffer.alloc(5, this.config.auth)
-    const provided = Buffer.alloc(5, req.headers.authorization?.replace("Bearer ", ""))
-
-    if (!timingSafeEqual(posessed, provided)) {
-      return res.status(418).send({
-        data: [],
-        statusCode: 418,
-        duration: 0,
-        errors: [{ message: "not today my little bish xqcL" }],
-      } as EvalResponse);
-    }
-
-    next();
-  }
-
-  private startServer() {
-    this.server.listen(this.config.port, () => {
-      console.log(`Server listening on port ${this.config.port}`);
-    });
-  }
-})(require("./config.json"));
+new Evaluator({
+  ...defaultConfig,
+  ...config
+});
